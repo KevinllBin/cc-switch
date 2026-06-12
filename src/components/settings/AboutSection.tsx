@@ -32,7 +32,6 @@ import type {
   ToolInstallationReport,
 } from "@/lib/api/settings";
 import { useUpdate } from "@/contexts/UpdateContext";
-import { relaunchApp } from "@/lib/updater";
 import { Badge } from "@/components/ui/badge";
 import { motion } from "framer-motion";
 import appIcon from "@/assets/icons/app-icon.png";
@@ -40,6 +39,7 @@ import { APP_ICON_MAP } from "@/config/appConfig";
 import type { AppId } from "@/lib/api/types";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { isWindows } from "@/lib/platform";
+import { isUpdateAvailable } from "@/lib/version";
 import { ToolUpgradeConfirmDialog } from "./ToolUpgradeConfirmDialog";
 import { ToolInstallRow } from "./ToolInstallRow";
 
@@ -194,14 +194,8 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
   );
   const [showInstallCommands, setShowInstallCommands] = useState(false);
 
-  const {
-    hasUpdate,
-    updateInfo,
-    updateHandle,
-    checkUpdate,
-    resetDismiss,
-    isChecking,
-  } = useUpdate();
+  const { hasUpdate, updateInfo, checkUpdate, resetDismiss, isChecking } =
+    useUpdate();
 
   const [wslShellByTool, setWslShellByTool] = useState<
     Record<string, WslShellPreference>
@@ -238,11 +232,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
     () =>
       TOOL_NAMES.filter((toolName) => {
         const tool = toolVersionByName.get(toolName);
-        return Boolean(
-          tool?.version &&
-            tool.latest_version &&
-            tool.version !== tool.latest_version,
-        );
+        return isUpdateAvailable(tool?.version, tool?.latest_version);
       }),
     [toolVersionByName],
   );
@@ -395,7 +385,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
   }, [t, updateInfo?.availableVersion, version]);
 
   const handleCheckUpdate = useCallback(async () => {
-    if (hasUpdate && updateHandle) {
+    if (hasUpdate) {
       if (isPortable) {
         try {
           await settingsApi.checkUpdates();
@@ -408,11 +398,16 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
       setIsDownloading(true);
       try {
         resetDismiss();
-        await updateHandle.downloadAndInstall();
-        await relaunchApp();
+        const installed = await settingsApi.installUpdateAndRestart();
+        if (!installed) {
+          toast.success(t("settings.upToDate"), { closeButton: true });
+        }
       } catch (error) {
         console.error("[AboutSection] Update failed", error);
-        toast.error(t("settings.updateFailed"));
+        toast.error(t("settings.updateFailed"), {
+          description: extractErrorMessage(error) || undefined,
+          closeButton: true,
+        });
         try {
           await settingsApi.checkUpdates();
         } catch (fallbackError) {
@@ -436,7 +431,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
       console.error("[AboutSection] Check update failed", error);
       toast.error(t("settings.checkUpdateFailed"));
     }
-  }, [checkUpdate, hasUpdate, isPortable, resetDismiss, t, updateHandle]);
+  }, [checkUpdate, hasUpdate, isPortable, resetDismiss, t]);
 
   const handleCopyInstallCommands = useCallback(async () => {
     try {
@@ -545,8 +540,7 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
               action === "update" &&
               Boolean(previousVersion) &&
               tool.version === previousVersion &&
-              Boolean(latestVersion) &&
-              tool.version !== latestVersion;
+              isUpdateAvailable(tool.version, latestVersion);
 
             if (versionUnchangedAfterUpdate) {
               // 有些上游 updater 会在未实际改动版本时仍返回 0。这里用刷新后的
@@ -949,10 +943,9 @@ export function AboutSection({ isPortable }: AboutSectionProps) {
             const displayName = TOOL_DISPLAY_NAMES[toolName];
             const isToolVersionLoading =
               isLoadingTools || Boolean(loadingTools[toolName]);
-            const isOutdated = Boolean(
-              tool?.version &&
-                tool.latest_version &&
-                tool.version !== tool.latest_version,
+            const isOutdated = isUpdateAvailable(
+              tool?.version,
+              tool?.latest_version,
             );
             // 已安装却跑不起来（如 Node 版本不达标）：用它区分卡片文案与按钮，避免把
             // "装了跑不起来"误判成"未安装"而给出无用的安装按钮（重装同一版本解决不了）。
