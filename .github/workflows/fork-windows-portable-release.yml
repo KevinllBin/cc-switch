@@ -105,7 +105,15 @@ jobs:
           }
 
           gh release view $tag *> $null
-          $releaseExists = ($LASTEXITCODE -eq 0)
+          $releaseViewExitCode = $LASTEXITCODE
+          if ($releaseViewExitCode -eq 0) {
+            $releaseExists = $true
+          } elseif ($releaseViewExitCode -eq 1) {
+            $releaseExists = $false
+          } else {
+            throw "Failed to check whether release '$tag' exists. gh exited with code $releaseViewExitCode."
+          }
+          $global:LASTEXITCODE = 0
 
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
