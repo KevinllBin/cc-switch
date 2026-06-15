@@ -28,5 +28,8 @@ flatpak-repo/
 copilot-api
 .history
 CODEBUDDY.md
-.github
+.github/*
+!.github/workflows/
+.github/workflows/*
+!.github/workflows/fork-windows-portable-release.yml
 mainWindow.js

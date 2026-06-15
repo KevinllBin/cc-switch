@@ -1,0 +1,210 @@
+name: Fork Windows Portable Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - ".github/**"
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: "Optional suffix for the generated tag. Defaults to the short commit SHA."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark the GitHub Release as a prerelease."
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-windows-portable-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-windows-portable:
+    name: Build and publish Windows portable
+    if: github.repository == 'KevinllBin/cc-switch'
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.12.3
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: pwsh
+        run: |
+          "path=$(pnpm store path --silent)" >> $env:GITHUB_OUTPUT
+
+      - name: Cache pnpm store
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG_SUFFIX: ${{ github.event.inputs.tag_suffix || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $package = Get-Content package.json -Raw | ConvertFrom-Json
+          $version = $package.version
+          $shortSha = $env:GITHUB_SHA.Substring(0, 8)
+
+          $tagSuffix = $env:INPUT_TAG_SUFFIX
+          if ($null -eq $tagSuffix) {
+            $tagSuffix = ''
+          }
+          $tagSuffix = $tagSuffix.Trim()
+          if ($tagSuffix.Length -eq 0) {
+            $tagSuffix = $shortSha
+          }
+          $tagSuffix = $tagSuffix -replace '[^A-Za-z0-9._-]', '-'
+
+          $tag = "win-portable-v$version-$tagSuffix"
+          $assetName = "CC-Switch-$tag-Windows-Portable.zip"
+          $releaseName = "CC Switch v$version Windows Portable ($shortSha)"
+
+          git fetch --tags --force
+          $tagExists = [bool](git tag --list $tag)
+          if ($tagExists) {
+            $tagSha = git rev-list -n 1 $tag
+            if ($tagSha -ne $env:GITHUB_SHA) {
+              throw "Tag '$tag' already exists at $tagSha, not the current commit $env:GITHUB_SHA. Use workflow_dispatch with a different tag_suffix."
+            }
+          }
+
+          gh release view $tag *> $null
+          $releaseExists = ($LASTEXITCODE -eq 0)
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "asset_name=$assetName" >> $env:GITHUB_OUTPUT
+          "release_name=$releaseName" >> $env:GITHUB_OUTPUT
+          "tag_exists=$($tagExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "release_exists=$($releaseExists.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+          if ($releaseExists) {
+            Write-Host "Release '$tag' already exists; skipping build and upload."
+          } else {
+            Write-Host "Release tag: $tag"
+            Write-Host "Asset name: $assetName"
+          }
+
+      - name: Build Tauri app without installers
+        if: steps.meta.outputs.release_exists != 'true'
+        run: pnpm tauri build --no-bundle --ci
+
+      - name: Package portable zip
+        if: steps.meta.outputs.release_exists != 'true'
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+
+          $exeCandidates = @(
+            'src-tauri/target/release/cc-switch.exe',
+            'src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe'
+          )
+          $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($null -eq $exePath) {
+            $exePath = Get-ChildItem -Path 'src-tauri/target' -Recurse -Filter 'cc-switch.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if ($null -eq $exePath) {
+            throw 'Portable executable was not found after the Tauri build.'
+          }
+
+          $portableDir = Join-Path $env:RUNNER_TEMP 'CC-Switch-Portable'
+          Remove-Item -Recurse -Force $portableDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+
+          Copy-Item $exePath (Join-Path $portableDir 'cc-switch.exe')
+          @(
+            '# CC Switch portable build marker',
+            'portable=true'
+          ) | Set-Content -Path (Join-Path $portableDir 'portable.ini') -Encoding UTF8
+
+          $assetPath = Join-Path 'release-assets' '${{ steps.meta.outputs.asset_name }}'
+          Compress-Archive -Path (Join-Path $portableDir '*') -DestinationPath $assetPath -Force
+
+          "asset_path=$assetPath" >> $env:GITHUB_OUTPUT
+          Write-Host "Created $assetPath"
+
+      - name: Create release tag
+        if: steps.meta.outputs.release_exists != 'true' && steps.meta.outputs.tag_exists != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ steps.meta.outputs.tag }}'
+          git tag $tag $env:GITHUB_SHA
+          git push origin "refs/tags/$tag"
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.release_exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_PRERELEASE: ${{ github.event.inputs.prerelease || 'true' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = '${{ steps.meta.outputs.tag }}'
+          $version = '${{ steps.meta.outputs.version }}'
+          $assetPath = '${{ steps.package.outputs.asset_path }}'
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+
+          @"
+          ## CC Switch v$version Windows Portable
+
+          Fork-only Windows portable build generated from main.
+
+          - Source commit: $env:GITHUB_SHA
+          - Portable mode: enabled by portable.ini
+          - Asset: ${{ steps.meta.outputs.asset_name }}
+          "@ | Set-Content -Path $notesPath -Encoding UTF8
+
+          $ghArgs = @(
+            'release', 'create', $tag, $assetPath,
+            '--verify-tag',
+            '--target', $env:GITHUB_SHA,
+            '--title', '${{ steps.meta.outputs.release_name }}',
+            '--notes-file', $notesPath
+          )
+          if ($env:INPUT_PRERELEASE -eq 'true') {
+            $ghArgs += '--prerelease'
+          }
+
+          gh @ghArgs
